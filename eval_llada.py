@@ -423,7 +423,7 @@ class LLaDAEvalHarness(LM):
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
             print(f"Total NFE is {num_nfe}")
 
-            with open(f"{end_time}.txt", 'a', encoding='utf-8') as f:
+            with open(f"{save_path.replace('.jsonl', '.txt')}", 'a', encoding='utf-8') as f:
                 f.write(f"Total number of tokens generated: {num_tokens}\n")
                 f.write(f"Total time taken: {end_time - start_time} seconds\n")
                 f.write(f"Tokens per second: {num_tokens / (end_time - start_time)}\n")
