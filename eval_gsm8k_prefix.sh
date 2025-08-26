@@ -15,21 +15,21 @@ test_num=100
 # parallel dual branch
 CUDA_VISIBLE_DEVICES=5 python eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
 --confirm_run_unsafe_code --model llada_dist \
---model_args main_threshold=0.9,spec_threshold=0.6,merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,use_cache=True \
---output_path ./eval_results/parallel_prefix_dual_branch/${task} \
+--model_args main_threshold=0.9,spec_threshold=0.6,merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,use_cache=True,save_dir="./eval_results/parallel_prefix_dual_branch/${task}_0.6" \
+--output_path ./eval_results/parallel_prefix_dual_branch/${task}_0.6 \
 --limit ${test_num} &
 
 # parallel dual branch
 CUDA_VISIBLE_DEVICES=6 python eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
 --confirm_run_unsafe_code --model llada_dist \
---model_args main_threshold=0.9,spec_threshold=0.9,merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,use_cache=True \
+--model_args main_threshold=0.9,spec_threshold=0.9,merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,use_cache=True,save_dir="./eval_results/parallel_prefix_dual_branch/${task}_0.8" \
 --output_path ./eval_results/parallel_prefix_dual_branch/${task}_0.8 \
 --limit ${test_num} &
 
 # parallel
 CUDA_VISIBLE_DEVICES=7 python eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
 --confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},threshold=0.9,show_speed=True,use_cache=True \
+--model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},threshold=0.9,show_speed=True,use_cache=True,save_dir="./eval_results/parallel_prefix/${task}" \
 --output_path ./eval_results/parallel_prefix/${task} \
 --limit ${test_num} &
 

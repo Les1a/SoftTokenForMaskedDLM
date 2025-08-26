@@ -190,18 +190,15 @@ def generate_with_prefix_cache_dual_branch(model, prompt, steps=128, gen_length=
         current_block_end = current_block_start + block_length
 
         # --- First forward pass for the block to establish the cache ---
-        # Stack main and speculative sequences into a single batch of size 2
-        x_batch = torch.cat([main_x, spec_x], dim=0)
-        
-        # Run a single forward pass to get logits and the initial KV cache for the entire sequence
-        output = model(x_batch, use_cache=True)
+        # Since main_x and spec_x are identical at this step, only forward main_x
+        output = model(main_x, use_cache=True)
         past_key_values = output.past_key_values
-        logits_batch = output.logits
-        
-        main_logits = logits_batch[0:1]
-        spec_logits = logits_batch[1:2]
+        logits = output.logits
+
+        main_logits = logits
+        spec_logits = logits.clone()  # spec branch copies main's logits
         nfe += 1
-        
+
         # --- Update both branches based on the first full pass ---
         # Main Branch Update
         main_mask_index = (main_x == mask_id)
@@ -254,7 +251,7 @@ def generate_with_prefix_cache_dual_branch(model, prompt, steps=128, gen_length=
             x_batch_block = torch.cat([main_x[:, current_block_start:], spec_x[:, current_block_start:]], dim=0)
 
             # Run forward pass on the current block using the shared prefix cache
-            logits_batch_block = model(x_batch_block, past_key_values=past_key_values, use_cache=True).logits
+            logits_batch_block = model(x_batch_block, past_key_values=past_key_values, use_cache=True, refresh=False).logits
             
             main_logits_block = logits_batch_block[0:1]
             spec_logits_block = logits_batch_block[1:2]
@@ -332,23 +329,23 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
     num_blocks = gen_length // block_length
 
     nfe = 0
-    
+
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
         # --- First forward pass ---
-        x_batch = torch.cat([main_x, spec_x], dim=0)
-        
-        # Run a single forward pass to get logits and the initial KV cache for the entire sequence
-        output = model(x_batch, use_cache=True)
+        # Since main and spec inputs are exactly the same, only forward main_x once
+        output = model(main_x, use_cache=True)
         past_key_values = output.past_key_values
-        logits_batch = output.logits
-        
-        main_logits = logits_batch[0:1]
-        spec_logits = logits_batch[1:2]
+        logits = output.logits
+
+        # main branch logits
+        main_logits = logits
+        # spec branch logits are just a copy of main branch
+        spec_logits = main_logits.clone()
         nfe += 1
-        
+
         # Main Branch Update
         main_mask_index = (main_x == mask_id)
         main_mask_index[:, current_block_end:] = False
@@ -378,7 +375,7 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
                 num_transfer_tokens=None, factor=factor
             )
         spec_x[spec_transfer_index] = spec_x0[spec_transfer_index]
-        
+
         i = 1
         replace_position = torch.zeros_like(main_x, dtype=torch.bool)
         replace_position[:, current_block_start:current_block_end] = 1
@@ -398,7 +395,7 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
             ], dim=0)
 
             # Run forward pass on the current block, providing the full cache and the position to update it
-            logits_batch_block = model(x_batch_block, past_key_values=past_key_values, use_cache=True, replace_position=replace_position).logits
+            logits_batch_block = model(x_batch_block, past_key_values=past_key_values, use_cache=True, replace_position=replace_position, refresh=False).logits
             
             main_logits_block = logits_batch_block[0:1]
             spec_logits_block = logits_batch_block[1:2]
