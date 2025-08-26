@@ -44,6 +44,7 @@ from generate import (
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
+
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -418,20 +419,76 @@ class LLaDAEvalHarness(LM):
             # self.accelerator.wait_for_everyone()
         end_time = time.time()
         if self.show_speed:
-            print(f"Total number of tokens generated: {num_tokens}")
-            print(f"Total time taken: {end_time - start_time} seconds")
-            print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
-            print(f"Total NFE is {num_nfe}")
-
-            with open(f"{save_path.replace('.jsonl', '.txt')}", 'a', encoding='utf-8') as f:
-                f.write(f"Total number of tokens generated: {num_tokens}\n")
-                f.write(f"Total time taken: {end_time - start_time} seconds\n")
-                f.write(f"Tokens per second: {num_tokens / (end_time - start_time)}\n")
-                f.write(f"Total NFE is {num_nfe}\n\n")
+            time_taken = end_time - start_time
+            base_path = save_path.split('rank_')[0]
             
+            # 1. Each rank writes its own metrics to a unique temporary file
+            temp_result_path = f"{base_path}rank_{self.rank}.tmp"
+            with open(temp_result_path, 'w', encoding='utf-8') as f:
+                f.write(f"{num_tokens},{num_nfe},{time_taken}")
+
+            # 2. Each rank creates a '.done' file to signal that it has finished writing.
+            done_file_path = f"{base_path}rank_{self.rank}.done"
+            with open(done_file_path, 'w') as f:
+                pass  # an empty file
+
+            # 3. Only rank 0 performs the aggregation and summary writing
+            if self.rank == 0:
+                for i in range(self.world_size):
+                    expected_done_file = f"{base_path}rank_{i}.done"
+                    while not os.path.exists(expected_done_file):
+                        time.sleep(0.2)  # check again
+
+                total_tokens = 0
+                total_nfe = 0
+                cumulative_time = 0.0
+
+                for i in range(self.world_size):
+                    rank_result_path = f"{base_path}rank_{i}.tmp"
+                    try:
+                        with open(rank_result_path, 'r', encoding='utf-8') as f:
+                            parts = f.read().strip().split(',')
+                            total_tokens += int(parts[0])
+                            total_nfe += int(parts[1])
+                            cumulative_time += float(parts[2]) # Summing time as requested
+                    except (FileNotFoundError, IndexError, ValueError) as e:
+                        print(f"Warning: Could not read or parse file for rank {i}: {e}")
+
+                average_time = cumulative_time / self.world_size if self.world_size > 0 else 0
+                tokens_per_second = total_tokens / average_time if average_time > 0 else 0
+
+                print(f"--- Aggregated Summary (all {self.world_size} ranks) ---")
+                print(f"Total number of tokens generated: {total_tokens}")
+                print(f"Cumulative compute time (sum across ranks): {cumulative_time:.2f} seconds")
+                print(f"Average time per rank: {average_time:.2f} seconds")
+                print(f"Overall Tokens per second (total_tokens / avg_time): {tokens_per_second:.2f}")
+                print(f"Total NFE is {total_nfe}")
+
+                summary_path = base_path + 'summary.txt'
+                with open(summary_path, 'w', encoding='utf-8') as f:
+                    f.write(f"Total number of tokens generated: {total_tokens}\n")
+                    f.write(f"Cumulative compute time (sum across ranks): {cumulative_time:.2f} seconds\n")
+                    f.write(f"Average time per rank: {average_time:.2f} seconds\n")
+                    f.write(f"Overall Tokens per second (total_tokens / avg_time): {tokens_per_second:.2f}\n")
+                    f.write(f"Total NFE is {total_nfe}\n\n")
+                
+                # 4. Clean up the temporary .tmp and .done files
+                for i in range(self.world_size):
+                    try:
+                        os.remove(f"{base_path}rank_{i}.tmp")
+                        os.remove(f"{base_path}rank_{i}.done")
+                    except OSError:
+                        pass
+                    
         return output
 
 
 if __name__ == "__main__":
+
+    # import debugpy
+    # debugpy.listen(5678) 
+    # debugpy.wait_for_client()
+    # debugpy.breakpoint()
+
     cli_evaluate()
     

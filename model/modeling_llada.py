@@ -718,8 +718,16 @@ class LLaDABlock(nn.Module):
         # shape: (B, n_kv_h, T, hs)
         v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
 
-        if layer_past is not None: 
+        if layer_past is not None:
             past_key, past_value = layer_past
+            current_batch_size = k.shape[0]
+
+            # Check if the past KV cache's batch size (B) is 1 and differs from the current input's batch size.
+            # If so, meaning mutiple branches, expand the past KV cache to match the current batch size.
+            if past_key.shape[0] == 1 and current_batch_size > 1:
+                past_key = past_key.expand(current_batch_size, -1, -1, -1).clone()
+                past_value = past_value.expand(current_batch_size, -1, -1, -1).clone()
+
             if replace_position is None:
                 k = torch.cat((past_key, k), dim=-2)
                 v = torch.cat((past_value, v), dim=-2)
@@ -1331,6 +1339,7 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
+        refresh=True,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1442,6 +1451,8 @@ class LLaDAModel(nn.Module):
                 ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
+        if not refresh:
+            attn_key_values = None
 
         # decoder layers
         all_hidden_states = []
@@ -1568,6 +1579,7 @@ class LLaDAModelLM(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+        refresh=True,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1587,6 +1599,7 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
+            refresh=refresh,
         )
         # import pdb; pdb.set_trace()
         logits = outputs.logits
