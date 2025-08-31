@@ -402,12 +402,13 @@ class LLaDAEvalHarness(LM):
 
             # output.append(generated_answer)
             output.extend(batched_generated_answer)
-
-            if self.save_dir is not None:
-                # 增量保存新生成的答案
-                with open(save_path, 'a', encoding='utf-8') as f:
-                    for generated_answer in batched_generated_answer:
-                        f.write(json.dumps(generated_answer, ensure_ascii=False) + '\n')
+            
+            # # Not save anwser context
+            # if self.save_dir is not None:
+            #     # 增量保存新生成的答案
+            #     with open(save_path, 'a', encoding='utf-8') as f:
+            #         for generated_answer in batched_generated_answer:
+            #             f.write(json.dumps(generated_answer, ensure_ascii=False) + '\n')
 
             for i in range(len(batched_generated_answer)):
                 print('=' * 20)

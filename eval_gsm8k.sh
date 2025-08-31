@@ -11,21 +11,26 @@ factor=1.0
 model_path='GSAI-ML/LLaDA-8B-Instruct'
 # You can change the model path to LLaDA-1.5 by setting model_path='GSAI-ML/LLaDA-1.5'
 
-# parallel dual branch
-accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args main_threshold=0.9,spec_threshold=0.6,merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,save_dir="./eval_results/parallel_dual_branch/${task}_0.6" \
---output_path ./eval_results/parallel_dual_branch/${task}_0.6 \
+spec_threshold_list=(0.5 0.6 0.7 0.75 0.8 0.85 0.9)
 
-# parallel dual branch
-accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args main_threshold=0.9,spec_threshold=0.8,merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,save_dir="./eval_results/parallel_dual_branch/${task}_0.8" \
---output_path ./eval_results/parallel_dual_branch/${task}_0.8 \
+for threshold in "${spec_threshold_list[@]}"
+do
+  echo "======================================================"
+  echo "Running evaluation with threshold: ${threshold}"
+  echo "======================================================"
 
-# parallel
-accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},threshold=0.9,show_speed=True,save_dir="./eval_results/parallel/${task}" \
---output_path ./eval_results/parallel/${task} \
+  output_dir="./eval_results/parallel_dual_branch/${task}_${threshold}"
+  output_dir_vanilla="./eval_results/parallel/${task}_${threshold}"
+
+  accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
+    --confirm_run_unsafe_code --model llada_dist \
+    --model_args main_threshold=0.9,spec_threshold=${threshold},merge_window=3,evolution_interval=4,model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,dual_branch=True,save_dir="${output_dir}" \
+    --output_path "${output_dir}"
+
+  accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
+    --confirm_run_unsafe_code --model llada_dist \
+    --model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},threshold=${threshold},show_speed=True,save_dir="${output_dir_vanilla}" \
+    --output_path "${output_dir_vanilla}"
+
+done
 

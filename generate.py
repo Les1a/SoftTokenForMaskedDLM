@@ -72,6 +72,7 @@ def generate_dual_branch(model, prompt, steps=128, gen_length=128, block_length=
     assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
     num_blocks = gen_length // block_length
 
+    batch_threshold = torch.tensor([main_threshold, spec_threshold], device=model.device).unsqueeze(1)
     nfe = 0
     
     # Process generation block by block
@@ -88,74 +89,62 @@ def generate_dual_branch(model, prompt, steps=128, gen_length=128, block_length=
             nfe += 1
             i += 1
             
-            # --- Batched Forward Pass ---
-            # Stack main and speculative sequences into a single batch of size 2
-            x_batch = torch.cat([main_x, spec_x], dim=0)
-            
-            # Run a single forward pass to get logits for both branches
-            logits_batch = model(x_batch).logits
-            
-            main_logits = logits_batch[0:1]
-            spec_logits = logits_batch[1:2]
+            # Check if the spec branch is already complete for this block
+            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                # 1. Forward pass for only the main branch
+                logits = model(main_x).logits
+                
+                # 2. Update the main branch
+                mask_index = (main_x == mask_id)
+                mask_index[:, current_block_end:] = False
 
-            # --- Main Branch Update ---
-            main_mask_index = (main_x == mask_id)
-            main_mask_index[:, current_block_end:] = False
-
-            if factor is None:
-                main_x0, main_transfer_index = get_transfer_index(
-                    main_logits, temperature, remasking, main_mask_index, main_x, 
-                    num_transfer_tokens=None, threshold=main_threshold
+                main_x = _update_branch(
+                    logits, temperature, remasking, mask_index,
+                    main_x, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold[0:1]
                 )
+
             else:
-                main_x0, main_transfer_index = get_transfer_index_dynamic(
-                    main_logits, temperature, remasking, main_mask_index, main_x, 
-                    num_transfer_tokens=None, factor=factor
+                # 1. Batched Forward Pass
+                x_batch = torch.cat([main_x, spec_x], dim=0)
+                logits_batch = model(x_batch).logits
+                
+                # 2. Batched Branch Update
+                batch_mask_index = (x_batch == mask_id)
+                batch_mask_index[:, current_block_end:] = False
+                
+                x_batch = _update_branch(
+                    logits_batch, temperature, remasking, batch_mask_index,
+                    x_batch, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold
                 )
-            main_x[main_transfer_index] = main_x0[main_transfer_index]
+                main_x, spec_x = x_batch.chunk(2, dim=0)
 
-            # --- Speculative Branch Update ---
-            # Only update the speculative branch if it still has masked tokens in the current block
-            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() > 0:
-                spec_mask_index = (spec_x == mask_id)
-                spec_mask_index[:, current_block_end:] = False
-
-                if factor is None:
-                    spec_x0, spec_transfer_index = get_transfer_index(
-                        spec_logits, temperature, remasking, spec_mask_index, spec_x, 
-                        num_transfer_tokens=None, threshold=spec_threshold
-                    )
-                else:
-                    spec_x0, spec_transfer_index = get_transfer_index_dynamic(
-                        spec_logits, temperature, remasking, spec_mask_index, spec_x, 
-                        num_transfer_tokens=None, factor=factor
-                    )
-                spec_x[spec_transfer_index] = spec_x0[spec_transfer_index]
-
-            # --- Merge and Reset Logic ---
-            # Periodically merge high-confidence tokens from the speculative branch to the main branch
+            # --- Vectorized Merge and Reset Logic ---
             if i > 0 and i % evolution_interval == 0:
                 decoded_main = main_x != mask_id
                 decoded_spec = spec_x != mask_id
-                # Find positions where tokens match and both are decoded
                 match_positions = (main_x == spec_x) & decoded_main & decoded_spec
                 
-                if match_positions.sum() > 0:
-                    match_indices = torch.where(match_positions[0])[0]
+                match_indices = match_positions[0].nonzero().squeeze(-1)
+                
+                if match_indices.numel() > 0:
+                    half_window = merge_window // 2
+                    offsets = torch.arange(-half_window, half_window + 1, device=model.device)
                     
-                    for match_idx in match_indices:
-                        # Skip matches outside the current working block
-                        if not (current_block_start <= match_idx < current_block_end):
-                            continue
-
-                        # Define the merge window around the matching token
-                        merge_start = max(current_block_start, int(match_idx - merge_window // 2))
-                        merge_end = min(current_block_end, int(match_idx + merge_window // 2 + 1))
-                        
-                        for pos in range(merge_start, merge_end):
-                            # Merge if main is [MASK] and spec has a decoded token
-                            if (main_x[0, pos] == mask_id and spec_x[0, pos] != mask_id and pos != match_idx):
-                                main_x[0, pos] = spec_x[0, pos]
+                    potential_merge_pos = match_indices[:, None] + offsets[None, :]
+                    
+                    merge_indices = torch.unique(potential_merge_pos.flatten())
+                    merge_indices = merge_indices[(merge_indices >= current_block_start) & (merge_indices < current_block_end)]
+                    
+                    update_mask = torch.zeros_like(main_x, dtype=torch.bool)
+                    update_mask[0, merge_indices] = True
+                    update_mask &= (main_x == mask_id)
+                    update_mask &= (spec_x != mask_id)
+                    # Don't overwrite the original match positions themselves
+                    update_mask[0, match_indices] = False
+                    
+                    main_x[update_mask] = spec_x[update_mask]
 
             # Reset the speculative branch if it is not making more progress than the main branch
             main_decoded_count = (main_x[:, current_block_start:current_block_end] != mask_id).sum()
@@ -164,7 +153,6 @@ def generate_dual_branch(model, prompt, steps=128, gen_length=128, block_length=
             if spec_decoded_count <= main_decoded_count:
                 spec_x = main_x.clone()
 
-    # Return the completed sequence from the main branch and the number of forward evaluations
     return main_x, nfe
 
 
@@ -183,6 +171,8 @@ def generate_with_prefix_cache_dual_branch(model, prompt, steps=128, gen_length=
     assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
     num_blocks = gen_length // block_length
 
+    batch_threshold = torch.tensor([main_threshold, spec_threshold], device=model.device).unsqueeze(1)
+
     nfe = 0
     
     for num_block in range(num_blocks):
@@ -190,45 +180,27 @@ def generate_with_prefix_cache_dual_branch(model, prompt, steps=128, gen_length=
         current_block_end = current_block_start + block_length
 
         # --- First forward pass for the block to establish the cache ---
-        # Since main_x and spec_x are identical at this step, only forward main_x
         output = model(main_x, use_cache=True)
         past_key_values = output.past_key_values
         logits = output.logits
 
         main_logits = logits
-        spec_logits = logits.clone()  # spec branch copies main's logits
+        spec_logits = logits.clone()
         nfe += 1
 
-        # --- Update both branches based on the first full pass ---
-        # Main Branch Update
-        main_mask_index = (main_x == mask_id)
-        main_mask_index[:, current_block_end:] = False
-        if factor is None:
-            main_x0, main_transfer_index = get_transfer_index(
-                main_logits, temperature, remasking, main_mask_index, main_x, 
-                num_transfer_tokens=None, threshold=main_threshold
+        # --- Batched update for both branches --- .expand(current_batch_size, -1).clone()
+        x_batch = torch.cat([main_x, spec_x], dim=0)
+        logits_batch = torch.cat([main_logits, spec_logits], dim=0)
+        
+        batch_mask_index = (x_batch == mask_id)
+        batch_mask_index[:, current_block_end:] = False
+        
+        x_batch = _update_branch(
+                logits_batch, temperature, remasking, batch_mask_index,
+                x_batch, num_transfer_tokens=None, factor=factor,
+                threshold=batch_threshold
             )
-        else:
-            main_x0, main_transfer_index = get_transfer_index_dynamic(
-                main_logits, temperature, remasking, main_mask_index, main_x, 
-                num_transfer_tokens=None, factor=factor
-            )
-        main_x[main_transfer_index] = main_x0[main_transfer_index]
-
-        # Speculative Branch Update
-        spec_mask_index = (spec_x == mask_id)
-        spec_mask_index[:, current_block_end:] = False
-        if factor is None:
-            spec_x0, spec_transfer_index = get_transfer_index(
-                spec_logits, temperature, remasking, spec_mask_index, spec_x, 
-                num_transfer_tokens=None, threshold=spec_threshold
-            )
-        else:
-            spec_x0, spec_transfer_index = get_transfer_index_dynamic(
-                spec_logits, temperature, remasking, spec_mask_index, spec_x, 
-                num_transfer_tokens=None, factor=factor
-            )
-        spec_x[spec_transfer_index] = spec_x0[spec_transfer_index]
+        main_x, spec_x = x_batch.chunk(2, dim=0)
 
         # The cache before the current block is identical for both branches
         new_past_key_values = []
@@ -247,62 +219,64 @@ def generate_with_prefix_cache_dual_branch(model, prompt, steps=128, gen_length=
             nfe += 1
             i += 1
 
-            # --- Batched Forward Pass with Prefix Cache ---
-            x_batch_block = torch.cat([main_x[:, current_block_start:], spec_x[:, current_block_start:]], dim=0)
-
-            # Run forward pass on the current block using the shared prefix cache
-            logits_batch_block = model(x_batch_block, past_key_values=past_key_values, use_cache=True, refresh=False).logits
-            
-            main_logits_block = logits_batch_block[0:1]
-            spec_logits_block = logits_batch_block[1:2]
-
-            # --- Main Branch Update (for the current block) ---
-            main_mask_index_block = (main_x[:, current_block_start:] == mask_id)
-            main_mask_index_block[:, block_length:] = False
-            if factor is None:
-                main_x0_block, main_transfer_index_block = get_transfer_index(
-                    main_logits_block, temperature, remasking, main_mask_index_block, 
-                    main_x[:, current_block_start:], num_transfer_tokens=None, threshold=main_threshold
+            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                # 1. Prepare input and mask for the main branch's suffix
+                main_input = main_x[:, current_block_start:]
+                mask_index = (main_input == mask_id)
+                mask_index[:, block_length:] = False
+                
+                # 2. Forward pass for only the main branch using the prefix cache
+                logits = model(main_input, past_key_values=past_key_values, use_cache=True, refresh=False).logits
+                
+                # 3. Update the main branch
+                updated_main_input = _update_branch(
+                    logits, temperature, remasking, mask_index,
+                    main_input, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold[0:1]
                 )
+                main_x[:, current_block_start:] = updated_main_input
+
             else:
-                main_x0_block, main_transfer_index_block = get_transfer_index_dynamic(
-                    main_logits_block, temperature, remasking, main_mask_index_block, 
-                    main_x[:, current_block_start:], num_transfer_tokens=None, factor=factor
+                # 1. Batched Forward Pass with Prefix Cache
+                x_batch = torch.cat([main_x[:, current_block_start:], spec_x[:, current_block_start:]], dim=0)
+                batch_mask_index = (x_batch == mask_id)
+                batch_mask_index[:, block_length:] = False
+                
+                logits_batch = model(x_batch, past_key_values=past_key_values, use_cache=True, refresh=False).logits
+                
+                # 2. Batched update for the current block
+                x_batch = _update_branch(
+                    logits_batch, temperature, remasking, batch_mask_index,
+                    x_batch, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold
                 )
-            main_x[:, current_block_start:][main_transfer_index_block] = main_x0_block[main_transfer_index_block]
+                main_x[:, current_block_start:], spec_x[:, current_block_start:] = x_batch.chunk(2, dim=0)
 
-            # --- Speculative Branch Update (for the current block) ---
-            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() > 0:
-                spec_mask_index_block = (spec_x[:, current_block_start:] == mask_id)
-                spec_mask_index_block[:, block_length:] = False
-                if factor is None:
-                    spec_x0_block, spec_transfer_index_block = get_transfer_index(
-                        spec_logits_block, temperature, remasking, spec_mask_index_block, 
-                        spec_x[:, current_block_start:], num_transfer_tokens=None, threshold=spec_threshold
-                    )
-                else:
-                    spec_x0_block, spec_transfer_index_block = get_transfer_index_dynamic(
-                        spec_logits_block, temperature, remasking, spec_mask_index_block, 
-                        spec_x[:, current_block_start:], num_transfer_tokens=None, factor=factor
-                    )
-                spec_x[:, current_block_start:][spec_transfer_index_block] = spec_x0_block[spec_transfer_index_block]
-
-            # --- Merge and Reset Logic ---
+            # ---Vectorized Merge and Reset Logic ---
             if i > 0 and i % evolution_interval == 0:
                 decoded_main = main_x != mask_id
                 decoded_spec = spec_x != mask_id
                 match_positions = (main_x == spec_x) & decoded_main & decoded_spec
                 
-                if match_positions.sum() > 0:
-                    match_indices = torch.where(match_positions[0])[0]
-                    for match_idx in match_indices:
-                        if not (current_block_start <= match_idx < current_block_end):
-                            continue
-                        merge_start = max(current_block_start, int(match_idx - merge_window // 2))
-                        merge_end = min(current_block_end, int(match_idx + merge_window // 2 + 1))
-                        for pos in range(merge_start, merge_end):
-                            if (main_x[0, pos] == mask_id and spec_x[0, pos] != mask_id and pos != match_idx):
-                                main_x[0, pos] = spec_x[0, pos]
+                match_indices = match_positions[0].nonzero().squeeze(-1)
+                
+                if match_indices.numel() > 0:
+                    half_window = merge_window // 2
+                    offsets = torch.arange(-half_window, half_window + 1, device=model.device)
+                    
+                    potential_merge_pos = match_indices[:, None] + offsets[None, :]
+                    
+                    merge_indices = torch.unique(potential_merge_pos.flatten())
+                    merge_indices = merge_indices[(merge_indices >= current_block_start) & (merge_indices < current_block_end)]
+                    
+                    update_mask = torch.zeros_like(main_x, dtype=torch.bool)
+                    update_mask[0, merge_indices] = True
+                    update_mask &= (main_x == mask_id)
+                    update_mask &= (spec_x != mask_id)
+                    # Don't overwrite the original match positions themselves
+                    update_mask[0, match_indices] = False
+                    
+                    main_x[update_mask] = spec_x[update_mask]
             
             main_decoded_count = (main_x[:, current_block_start:current_block_end] != mask_id).sum()
             spec_decoded_count = (spec_x[:, current_block_start:current_block_end] != mask_id).sum()
@@ -328,6 +302,7 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
     assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
     num_blocks = gen_length // block_length
 
+    batch_threshold = torch.tensor([main_threshold, spec_threshold], device=model.device).unsqueeze(1)
     nfe = 0
 
     for num_block in range(num_blocks):
@@ -346,35 +321,19 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
         spec_logits = main_logits.clone()
         nfe += 1
 
-        # Main Branch Update
-        main_mask_index = (main_x == mask_id)
-        main_mask_index[:, current_block_end:] = False
-        if factor is None:
-            main_x0, main_transfer_index = get_transfer_index(
-                main_logits, temperature, remasking, main_mask_index, main_x, 
-                num_transfer_tokens=None, threshold=main_threshold
+        x_batch = torch.cat([main_x, spec_x], dim=0)
+        logits_batch = torch.cat([main_logits, spec_logits], dim=0)
+        
+        batch_mask_index = (x_batch == mask_id)
+        batch_mask_index[:, current_block_end:] = False
+        
+        # --- Batched update for both branches ---
+        x_batch = _update_branch(
+                logits_batch, temperature, remasking, batch_mask_index,
+                x_batch, num_transfer_tokens=None, factor=factor,
+                threshold=batch_threshold
             )
-        else:
-            main_x0, main_transfer_index = get_transfer_index_dynamic(
-                main_logits, temperature, remasking, main_mask_index, main_x, 
-                num_transfer_tokens=None, factor=factor
-            )
-        main_x[main_transfer_index] = main_x0[main_transfer_index]
-
-        # Speculative Branch Update
-        spec_mask_index = (spec_x == mask_id)
-        spec_mask_index[:, current_block_end:] = False
-        if factor is None:
-            spec_x0, spec_transfer_index = get_transfer_index(
-                spec_logits, temperature, remasking, spec_mask_index, spec_x, 
-                num_transfer_tokens=None, threshold=spec_threshold
-            )
-        else:
-            spec_x0, spec_transfer_index = get_transfer_index_dynamic(
-                spec_logits, temperature, remasking, spec_mask_index, spec_x, 
-                num_transfer_tokens=None, factor=factor
-            )
-        spec_x[spec_transfer_index] = spec_x0[spec_transfer_index]
+        main_x, spec_x = x_batch.chunk(2, dim=0)
 
         i = 1
         replace_position = torch.zeros_like(main_x, dtype=torch.bool)
@@ -388,64 +347,79 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
             nfe += 1
             i += 1
 
-            # --- Batched Forward Pass with Full Cache and Replace Position ---
-            x_batch_block = torch.cat([
-                main_x[:, current_block_start:current_block_end], 
-                spec_x[:, current_block_start:current_block_end]
-            ], dim=0)
+            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                # 1. Prepare input and mask for the main branch's current block
+                main_input_block = main_x[:, current_block_start:current_block_end]
+                mask_index_block = (main_input_block == mask_id)
 
-            # Run forward pass on the current block, providing the full cache and the position to update it
-            logits_batch_block = model(x_batch_block, past_key_values=past_key_values, use_cache=True, replace_position=replace_position, refresh=False).logits
-            
-            main_logits_block = logits_batch_block[0:1]
-            spec_logits_block = logits_batch_block[1:2]
+                # 2. Forward pass for the main branch's block, providing the full cache and replace_position
+                logits = model(
+                    main_input_block, past_key_values=past_key_values, use_cache=True, 
+                    replace_position=replace_position, refresh=False
+                ).logits
 
-            # --- Main Branch Update (for the current block) ---
-            main_mask_index_block = (main_x[:, current_block_start:current_block_end] == mask_id)
-            if factor is None:
-                main_x0_block, main_transfer_index_block = get_transfer_index(
-                    main_logits_block, temperature, remasking, main_mask_index_block, 
-                    main_x[:, current_block_start:current_block_end], num_transfer_tokens=None, threshold=main_threshold
+                # 3. Update the main branch
+                updated_main_block = _update_branch(
+                    logits, temperature, remasking, mask_index_block,
+                    main_input_block, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold[0:1]
                 )
+                main_x[:, current_block_start:current_block_end] = updated_main_block
+
             else:
-                main_x0_block, main_transfer_index_block = get_transfer_index_dynamic(
-                    main_logits_block, temperature, remasking, main_mask_index_block, 
-                    main_x[:, current_block_start:current_block_end], num_transfer_tokens=None, factor=factor
+                # 1. Batched Forward Pass with Full Cache and Replace Position
+                x_batch = torch.cat([
+                    main_x[:, current_block_start:current_block_end], 
+                    spec_x[:, current_block_start:current_block_end]
+                ], dim=0)
+
+                logits_batch = model(
+                    x_batch, past_key_values=past_key_values, use_cache=True, 
+                    replace_position=replace_position, refresh=False
+                ).logits
+
+                # 2. Batched update for the current block
+                batch_mask_index_block = (x_batch == mask_id)
+                x_batch = _update_branch(
+                    logits_batch, temperature, remasking, batch_mask_index_block,
+                    x_batch, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold
                 )
-            main_x[:, current_block_start:current_block_end][main_transfer_index_block] = main_x0_block[main_transfer_index_block]
+                main_x[:, current_block_start:current_block_end], spec_x[:, current_block_start:current_block_end] = x_batch.chunk(2, dim=0)
 
-            # --- Speculative Branch Update (for the current block) ---
-            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() > 0:
-                spec_mask_index_block = (spec_x[:, current_block_start:current_block_end] == mask_id)
-                if factor is None:
-                    spec_x0_block, spec_transfer_index_block = get_transfer_index(
-                        spec_logits_block, temperature, remasking, spec_mask_index_block, 
-                        spec_x[:, current_block_start:current_block_end], num_transfer_tokens=None, threshold=spec_threshold
-                    )
-                else:
-                    spec_x0_block, spec_transfer_index_block = get_transfer_index_dynamic(
-                        spec_logits_block, temperature, remasking, spec_mask_index_block, 
-                        spec_x[:, current_block_start:current_block_end], num_transfer_tokens=None, factor=factor
-                    )
-                spec_x[:, current_block_start:current_block_end][spec_transfer_index_block] = spec_x0_block[spec_transfer_index_block]
 
-            # --- Merge and Reset Logic ---
+            # --- Vectorized Merge and Reset Logic ---
             if i > 0 and i % evolution_interval == 0:
                 decoded_main = main_x != mask_id
                 decoded_spec = spec_x != mask_id
                 match_positions = (main_x == spec_x) & decoded_main & decoded_spec
                 
-                if match_positions.sum() > 0:
-                    match_indices = torch.where(match_positions[0])[0]
-                    for match_idx in match_indices:
-                        if not (current_block_start <= match_idx < current_block_end):
-                            continue
-                        merge_start = max(current_block_start, int(match_idx - merge_window // 2))
-                        merge_end = min(current_block_end, int(match_idx + merge_window // 2 + 1))
-                        for pos in range(merge_start, merge_end):
-                            if (main_x[0, pos] == mask_id and spec_x[0, pos] != mask_id and pos != match_idx):
-                                main_x[0, pos] = spec_x[0, pos]
-            
+                match_indices = match_positions[0].nonzero().squeeze(-1)
+                
+                if match_indices.numel() > 0:
+                    # Create all window offsets at once
+                    half_window = merge_window // 2
+                    offsets = torch.arange(-half_window, half_window + 1, device=model.device)
+                    
+                    # Use broadcasting to create all potential merge positions
+                    # Shape: (num_matches, merge_window_size)
+                    potential_merge_pos = match_indices[:, None] + offsets[None, :]
+                    
+                    # Get unique indices within the current block
+                    merge_indices = torch.unique(potential_merge_pos.flatten())
+                    merge_indices = merge_indices[(merge_indices >= current_block_start) & (merge_indices < current_block_end)]
+                    
+                    # Create a boolean mask for the final update conditions
+                    update_mask = torch.zeros_like(main_x, dtype=torch.bool)
+                    update_mask[0, merge_indices] = True
+                    update_mask &= (main_x == mask_id)
+                    update_mask &= (spec_x != mask_id)
+                    # Don't overwrite the original match positions themselves
+                    update_mask[0, match_indices] = False
+                    
+                    # Perform the merge in one vectorized operation
+                    main_x[update_mask] = spec_x[update_mask]
+
             main_decoded_count = (main_x[:, current_block_start:current_block_end] != mask_id).sum()
             spec_decoded_count = (spec_x[:, current_block_start:current_block_end] != mask_id).sum()
             
@@ -647,6 +621,71 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
             i += 1
 
     return x, nfe
+
+def _update_branch(logits, temperature, remasking, mask_index, x, num_transfer_tokens=None, threshold=None, factor=None):
+    """Helper function for main and spec branch updates."""
+    if factor is None:
+        x0, transfer_index = get_transfer_index_parallel(
+            logits, temperature, remasking, mask_index, x, 
+            num_transfer_tokens=num_transfer_tokens, threshold=threshold
+        )
+    else:
+        raise NotImplementedError("Factor-based dynamic updates not integrated into this parallel example.")
+    
+    x[transfer_index] = x0[transfer_index]
+    return x
+
+
+def get_transfer_index_parallel(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
+    # --- Step 1: Initial Token Prediction and Confidence Calculation (Unchanged) ---
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)
+
+    if remasking == 'low_confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+    elif remasking == 'random':
+        x0_p = torch.rand_like(x0, dtype=torch.float32)
+    else:
+        raise NotImplementedError(remasking)
+    x0 = torch.where(mask_index, x0, x)
+    confidence = torch.where(mask_index, x0_p, -torch.inf)
+
+    # --- Step 2: Parallel Token Selection ---
+    if threshold is not None:
+        num_to_consider = mask_index.sum(dim=1, keepdim=True)
+    else:
+        num_to_consider = num_transfer_tokens
+
+    max_k = num_to_consider.max().item()
+    if max_k == 0:
+        return x0, torch.zeros_like(x0, dtype=torch.bool)
+
+    top_confidences, top_indices = torch.topk(confidence, k=max_k, dim=-1)
+
+    # --- Step 3: Create Masks for Parallel Filtering (Core Correction) ---
+    k_range = torch.arange(max_k, device=x0.device)[None, :]
+    valid_k_mask = k_range < num_to_consider
+
+    if threshold is not None:
+        # Mask 2.1: Standard threshold check
+        threshold_mask = top_confidences >= threshold # (b, max_k)
+
+        # Mask 2.2: Create a mask that is only True for the first column (k=0), Top-1 Token
+        is_top1_mask = torch.zeros_like(threshold_mask, dtype=torch.bool)
+        if max_k > 0:
+            is_top1_mask[:, 0] = True
+        corrected_threshold_mask = threshold_mask | is_top1_mask
+
+        final_selection_mask = valid_k_mask & corrected_threshold_mask
+    else:
+        final_selection_mask = valid_k_mask
+
+    # --- Step 4: Use scatter_ to Parallelly Update Final Result ---
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+    transfer_index.scatter_(dim=1, index=top_indices, src=final_selection_mask)
+
+    return x0, transfer_index
 
 
 def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
