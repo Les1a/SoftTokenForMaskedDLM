@@ -430,6 +430,145 @@ def generate_with_dual_cache_dual_branch(model, prompt, steps=128, gen_length=12
 
 
 @ torch.no_grad()
+def generate_with_dual_branch_embedding(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0., 
+                                        remasking='low_confidence', mask_id=126336, factor=None,
+                                        main_threshold=0.9, spec_threshold=0.6, evolution_interval=4, merge_window=0.9):
+    '''
+    Generating using a dual-branch strategy with a shared KV cache,
+    Merge strategy: use last-layer embeddings similarity between main/spec for the current forward block.
+    If cosine similarity >= merge_window, merge spec token into main at that position (only where main is masked).
+    '''
+    # Initialize two sequences: main and speculative
+    main_x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+    main_x[:, :prompt.shape[1]] = prompt.clone()
+    spec_x = main_x.clone()
+
+    assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
+    num_blocks = gen_length // block_length
+
+    batch_threshold = torch.tensor([main_threshold, spec_threshold], device=model.device).unsqueeze(1)
+    nfe = 0
+
+    # holders for "current forward" last-layer embeddings of the current block
+    last_main_emb_block = None  # shape: (block_len, hidden_dim)
+    last_spec_emb_block = None  # shape: (block_len, hidden_dim)
+
+    for num_block in range(num_blocks):
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        # --- First forward pass ---
+        # Since main and spec inputs are exactly the same, only forward main_x once
+        output = model(main_x, use_cache=True)
+        past_key_values = output.past_key_values
+        logits = output.logits
+
+        # main branch logits
+        main_logits = logits
+        # spec branch logits are just a copy of main branch
+        spec_logits = main_logits.clone()
+        nfe += 1
+
+        x_batch = torch.cat([main_x, spec_x], dim=0)
+        logits_batch = torch.cat([main_logits, spec_logits], dim=0)
+        
+        batch_mask_index = (x_batch == mask_id)
+        batch_mask_index[:, current_block_end:] = False
+        
+        # --- Batched update for both branches ---
+        x_batch = _update_branch(
+                logits_batch, temperature, remasking, batch_mask_index,
+                x_batch, num_transfer_tokens=None, factor=factor,
+                threshold=batch_threshold
+            )
+        main_x, spec_x = x_batch.chunk(2, dim=0)
+
+        i = 1
+        replace_position = torch.zeros_like(main_x, dtype=torch.bool)
+        replace_position[:, current_block_start:current_block_end] = 1
+
+        while True:
+            # If the main branch has completed the current block, move to the next
+            if (main_x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                break
+            
+            nfe += 1
+            i += 1
+
+            if (spec_x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                # 1. Prepare input and mask for the main branch's current block
+                main_input_block = main_x[:, current_block_start:current_block_end]
+                mask_index_block = (main_input_block == mask_id)
+
+                # 2. Forward pass for the main branch's block, providing the full cache and replace_position
+                out_main = model(
+                    main_input_block, past_key_values=past_key_values, use_cache=True, 
+                    replace_position=replace_position, refresh=False,
+                )
+                logits = out_main.logits
+
+                # 3. Update the main branch
+                updated_main_block = _update_branch(
+                    logits, temperature, remasking, mask_index_block,
+                    main_input_block, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold[0:1]
+                )
+                main_x[:, current_block_start:current_block_end] = updated_main_block
+
+            else:
+                # 1. Batched Forward Pass with Full Cache and Replace Position
+                x_batch = torch.cat([
+                    main_x[:, current_block_start:current_block_end], 
+                    spec_x[:, current_block_start:current_block_end]
+                ], dim=0)
+
+                out_batch, _hs = model(
+                    x_batch, past_key_values=past_key_values, use_cache=True, 
+                    replace_position=replace_position, refresh=False, output_last_embedding=True
+                )
+                logits_batch = out_batch.logits
+
+                last_main_emb_block = _hs[0]  # (block_len, D)
+                last_spec_emb_block = _hs[1]  # (block_len, D)
+
+                # 2. Batched update for the current block
+                batch_mask_index_block = (x_batch == mask_id)
+                x_batch = _update_branch(
+                    logits_batch, temperature, remasking, batch_mask_index_block,
+                    x_batch, num_transfer_tokens=None, factor=factor,
+                    threshold=batch_threshold
+                )
+                main_x[:, current_block_start:current_block_end], spec_x[:, current_block_start:current_block_end] = x_batch.chunk(2, dim=0)
+
+            # --- Similarity-based Merge Logic (no window; match across the whole block) ---
+            if i > 0 and i % evolution_interval == 0:
+                sim = torch.nn.functional.cosine_similarity(
+                    last_main_emb_block, last_spec_emb_block, dim=-1, eps=1e-8
+                )  # (block_len,)
+
+                main_block = main_x[:, current_block_start:current_block_end]
+                spec_block = spec_x[:, current_block_start:current_block_end]
+                main_masked = (main_block == mask_id)          # (1, block_len)
+                spec_decoded = (spec_block != mask_id)         # (1, block_len)
+                sim_good = (sim >= merge_window).unsqueeze(0)  # (1, block_len) for broadcast
+
+                merge_mask = main_masked & spec_decoded & sim_good  # (1, block_len)
+
+                if merge_mask.any():
+                    main_block[merge_mask] = spec_block[merge_mask]
+                    main_x[:, current_block_start:current_block_end] = main_block  # 写回
+
+            main_decoded_count = (main_x[:, current_block_start:current_block_end] != mask_id).sum()
+            spec_decoded_count = (spec_x[:, current_block_start:current_block_end] != mask_id).sum()
+            
+            if spec_decoded_count <= main_decoded_count:
+                spec_x = main_x.clone()
+                last_spec_emb_block = last_main_emb_block
+
+    return main_x, nfe
+
+
+@ torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
              remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
     '''
@@ -622,6 +761,194 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
 
     return x, nfe
 
+@torch.no_grad()
+def generate_with_dual_cache_evlove_block(
+    model,
+    prompt,
+    steps=128,
+    gen_length=128,
+    block_length=128,
+    temperature=0.0,
+    remasking="low_confidence",
+    mask_id=126336,
+    threshold=None,
+    factor=None,
+):
+    """
+    New decode flow:
+    - Within each block, start with an active input length of 8 tokens (or less if block < 8).
+    - As tokens are decoded, we *grow* the active input by appending masked tokens:
+        After each newly decoded token, append one [MASK] to the active window.
+        For a consecutive run of n newly decoded tokens, append n masks after the last decoded token.
+      (The active length increases by the number of tokens newly decoded at each step.)
+    - Stop growing once the active length reaches the block size.
+    """
+    # Initialize sequence with [MASK]s for the generation region
+    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+
+    nfe = 0
+    for num_block in range(num_blocks):
+        blk_start = prompt.shape[1] + num_block * block_length
+        blk_end = blk_start + block_length
+
+        # Precompute planned transfer counts per step for this block
+        block_mask_index = (x[:, blk_start:blk_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # [B, steps]
+
+        # Seed cache with a full forward pass once per block
+        out = model(x, use_cache=True)
+        past_key_values = out.past_key_values
+        nfe += 1
+
+        # Active window within the block starts small and grows as we decode
+        active_len = min(8, block_length)
+
+        # A global boolean map for cache replacement; we expand it as active_len grows
+        replace_position = torch.zeros_like(x, dtype=torch.bool, device=x.device)
+        replace_position[:, blk_start:blk_start + active_len] = True
+
+        # Iteration index over planned steps (clamped)
+        step_idx = 0
+
+        # Continue until the whole block is fully decoded
+        while (x[:, blk_start:blk_end] == mask_id).sum() > 0:
+            # If active window hasn't yet reached full block, keep it growing;
+            # otherwise we just decode within the full block.
+            cur_end = blk_start + active_len
+
+            # Masked positions only within the active window
+            local_slice = x[:, blk_start:cur_end]
+            local_mask_index = (local_slice == mask_id)
+
+            # If there are no masks in the current active window but the block still has masks
+            if local_mask_index.sum() == 0 and active_len < block_length:
+                active_len = min(block_length, active_len + 1)
+                replace_position[:, blk_start:blk_start + active_len] = True
+                continue
+
+            # Forward only on the current active window with cache
+            logits = model(
+                x[:, blk_start:cur_end],
+                past_key_values=past_key_values,
+                use_cache=True,
+                replace_position=replace_position,
+            ).logits
+            nfe += 1
+
+            if threshold is None:
+                k_col = min(step_idx, steps_per_block - 1)
+                k_this = num_transfer_tokens[:, k_col]  # [B]
+            else:
+                k_this = None  # threshold mode ignores explicit per-step counts
+
+            # Select positions to transfer within the *active window*
+            x0, local_transfer = get_transfer_index(
+                logits, temperature, remasking, local_mask_index, local_slice, k_this, threshold
+            )
+
+            # Apply transfers to the global x within the active window
+            newly_decoded = local_transfer.sum(dim=1)  # [B], typically batch = 1
+            x[:, blk_start:cur_end][local_transfer] = x0[local_transfer]
+
+            # Grow the active window length by the number of newly decoded tokens (respecting block bound)
+            # After each newly decoded token, append one [MASK]; for a run of n, append n masks.
+            grow_by = int(newly_decoded.max().item()) if newly_decoded.numel() > 0 else 0
+            if grow_by > 0 and active_len < block_length:
+                active_len = min(block_length, active_len + grow_by)
+                replace_position[:, blk_start:blk_start + active_len] = True
+
+            step_idx += 1
+
+            # If we've already exposed the full block, update to decode on the full block window going forward
+            if active_len >= block_length:
+                replace_position[:, blk_start:blk_end] = True
+
+            # Early exit if block is fully decoded
+            if (x[:, blk_start:blk_end] == mask_id).sum() == 0:
+                break
+
+    return x, nfe
+
+
+@ torch.no_grad()
+def generate_with_dual_cache_soft_token(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+            remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+    '''
+    Args:
+        model: Mask predictor.
+        prompt: A tensor of shape (1, L).
+        steps: Sampling steps, less than or equal to gen_length.
+        gen_length: Generated answer length.
+        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
+        temperature: Categorical distribution sampling temperature.
+        cfg_scale: Unsupervised classifier-free guidance scale.
+        remasking: Remasking strategy. 'low_confidence' or 'random'.
+        mask_id: The toke id of [MASK] is 126336.
+    '''
+    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps = steps // num_blocks
+
+    nfe = 0  
+    for num_block in range(num_blocks):
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+
+        # cache init and update
+        output = model(x, use_cache=True)
+        past_key_values = output.past_key_values
+        mask_index = (x == mask_id)
+        mask_index[:, current_block_end:] = 0
+        if factor is None:
+            x0, transfer_index, soft_token, prob = get_transfer_index_soft_token(
+                output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+            soft_token, prob = soft_token[:, current_block_start:current_block_end], prob[:, current_block_start:current_block_end] 
+        else:
+            raise NotImplementedError("not yet support fator operation for soft token")
+        x[transfer_index] = x0[transfer_index]
+        nfe += 1
+
+        i = 1
+        replace_position = torch.zeros_like(x, dtype=torch.bool)
+        replace_position[:, current_block_start:current_block_end] = 1
+        while True:
+            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                break
+            nfe += 1
+            mask_index = (x[:, current_block_start:current_block_end] == mask_id)
+            # cache position is the position between current_block_start and current_block_end
+            logits = model(
+                x[:, current_block_start:current_block_end], past_key_values=past_key_values, 
+                use_cache=True, replace_position=replace_position,
+                soft_token=soft_token, prob=prob).logits
+
+            if factor is None:
+                x0, transfer_index, soft_token, prob = get_transfer_index_soft_token(
+                    logits, temperature, remasking, mask_index, 
+                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+            else:
+                raise NotImplementedError("not yet support fator operation for soft token")
+            x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
+            i += 1
+
+    return x, nfe
+
+
 def _update_branch(logits, temperature, remasking, mask_index, x, num_transfer_tokens=None, threshold=None, factor=None):
     """Helper function for main and spec branch updates."""
     if factor is None:
@@ -715,6 +1042,45 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
                 if confidence[j, select_index[k]] < threshold:
                     transfer_index[j, select_index[k]] = False
     return x0, transfer_index
+
+
+def get_transfer_index_soft_token(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+
+    if remasking == 'low_confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.squeeze(
+            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+    elif remasking == 'random':
+        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+    else:
+        raise NotImplementedError(remasking)
+    
+    x0 = torch.where(mask_index, x0, x)
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    if threshold is not None:
+        num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
+    for j in range(confidence.shape[0]):
+        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j])
+        transfer_index[j, select_index] = True
+        if threshold is not None:
+            for k in range(1, num_transfer_tokens[j]):
+                if confidence[j, select_index[k]] < threshold:
+                    transfer_index[j, select_index[k]] = False
+
+    # TODO: soft token hyperparameters
+    k_soft = 5  # hyperparameter 1
+    prob, soft_token = torch.topk(p, k=k_soft, dim=-1)  # both (B, L, 5)
+    addition_prob_mask = 0.5 # hyperparameter 2
+    mask_prob = 1 - prob[..., :1] + addition_prob_mask  # (B, L, 1) with max probability
+    mask_token = torch.full_like(soft_token[..., :1], 126336)
+    prob = torch.cat((prob, mask_prob), dim=-1)
+    soft_token = torch.cat((soft_token, mask_token), dim=-1)
+
+    return x0, transfer_index, soft_token.to(torch.long), prob.to(logits.dtype)
 
 def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)

@@ -1121,6 +1121,8 @@ class LLaDAOutput(NamedTuple):
     Hidden states from each block.
     """
 
+    last_embedding: Optional[Tuple[torch.Tensor]]
+
 
 class LLaDAGenerateOutput(NamedTuple):
     token_ids: torch.LongTensor
@@ -1338,8 +1340,11 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        output_last_embedding: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
         refresh=True,
+        soft_token=None,
+        prob=None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1387,9 +1392,33 @@ class LLaDAModel(nn.Module):
         else:
             past_length = past_key_values[0][0].size(-2)
 
-        # Get embeddings of input.
-        # shape: (batch_size, seq_len, d_model)
-        x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
+        MASK_TOKEN_ID = 126336
+        E = self.transformer.wte  # nn.Embedding
+
+        # 1) basic token embedding
+        if input_embeddings is None:
+            x_base = E(input_ids)  # [B, L, d_model]
+        else:
+            x_base = input_embeddings
+
+        if (soft_token is None) or (prob is None):
+            x = x_base
+            
+        # 2) soft token embedding
+        else:
+            mask = (input_ids == MASK_TOKEN_ID)              # [B, L], bool
+
+            if mask.any():
+                soft_emb = F.embedding(soft_token, E.weight)  # [B, L, K, d_model]
+
+                prob_safe = prob.clamp_min(0)
+                denom = prob_safe.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # [B, L, 1]
+                prob_norm = prob_safe / denom                                  # [B, L, K]
+
+                x_soft = (prob_norm.unsqueeze(-1) * soft_emb).sum(dim=-2)      # [B, L, d_model]
+                x = torch.where(mask.unsqueeze(-1), x_soft, x_base)            # [B, L, d_model]
+            else:
+                x = x_base
 
         if self.config.input_emb_norm:
             x = x * (self.config.d_model**0.5)
@@ -1510,6 +1539,9 @@ class LLaDAModel(nn.Module):
                     assert cache is not None
                     attn_key_values.extend(cache)
 
+        if output_last_embedding:
+            last_embedding = x
+
         if last_logits_only:
             # shape: (batch_size, 1, d_model)
             x = x[:, -1, :].unsqueeze(1)
@@ -1530,7 +1562,10 @@ class LLaDAModel(nn.Module):
         if self.config.scale_logits:
             logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, 
+                           hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
+                           last_embedding=last_embedding if output_last_embedding else None,
+                           )  # type: ignore[arg-type]
 
 
 def create_model_config_from_pretrained_config(config: LLaDAConfig):
@@ -1577,9 +1612,12 @@ class LLaDAModelLM(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_last_embedding: Optional[bool] = False,
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
         refresh=True,
+        soft_token=None,
+        prob=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1598,8 +1636,11 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
+            output_last_embedding=output_last_embedding,
             replace_position=replace_position,
             refresh=refresh,
+            soft_token=soft_token,
+            prob=prob,
         )
         # import pdb; pdb.set_trace()
         logits = outputs.logits
@@ -1613,11 +1654,18 @@ class LLaDAModelLM(PreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
-            logits=logits,
-            past_key_values=outputs.attn_key_values,
-            hidden_states=hidden_states,
-        )
+        if not output_last_embedding:
+            return CausalLMOutputWithPast(
+                logits=logits,
+                past_key_values=outputs.attn_key_values,
+                hidden_states=hidden_states,
+            )
+        else:
+            return CausalLMOutputWithPast(
+                logits=logits,
+                past_key_values=outputs.attn_key_values,
+                hidden_states=hidden_states,
+            ), outputs.last_embedding
 
     def can_generate(self) -> bool:
         return True

@@ -39,7 +39,10 @@ from generate import (
     generate_with_dual_cache, 
     generate_dual_branch, 
     generate_with_dual_cache_dual_branch, 
-    generate_with_prefix_cache_dual_branch
+    generate_with_prefix_cache_dual_branch,
+    generate_with_dual_cache_evlove_block,
+    generate_with_dual_branch_embedding,
+    generate_with_dual_cache_soft_token
     )
 from model.modeling_llada import LLaDAModelLM
 import json
@@ -80,6 +83,7 @@ class LLaDAEvalHarness(LM):
         spec_threshold=0.6,
         merge_window=3,
         evolution_interval=4,
+        soft_token=False,
         **kwargs,
     ):
         '''
@@ -146,6 +150,7 @@ class LLaDAEvalHarness(LM):
         self.show_speed = show_speed
         self.dual_cache = dual_cache
         self.dual_branch = dual_branch
+        self.soft_token = soft_token
 
         self.main_threshold = main_threshold
         self.spec_threshold = spec_threshold
@@ -371,8 +376,12 @@ class LLaDAEvalHarness(LM):
                                             main_threshold=self.main_threshold, spec_threshold=self.spec_threshold, merge_window=self.merge_window, evolution_interval=self.evolution_interval)
             else:
                 if self.use_cache:
-                    if self.dual_cache:
+                    if self.dual_cache and not self.soft_token:
                         generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+                                            temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                    elif self.soft_token:
+                        print("generate with soft token")
+                        generated_answer, nfe = generate_with_dual_cache_soft_token(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                             temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
                     else:
                         generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
@@ -382,10 +391,11 @@ class LLaDAEvalHarness(LM):
                                             temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
 
             if self.is_instruct and 'task_id' in req.doc and str(req.doc['task_id']).lower().startswith('humaneval'):
+                generated_answer_ids = generated_answer[:, input_ids.shape[1]:]
                 if self.show_speed:
-                    num_tokens += (generated_answer != 126081).sum()
+                    num_tokens += (generated_answer_ids != 126081).sum()
                     num_nfe += nfe
-                generated_answer = self.tokenizer.decode(generated_answer[0][input_ids.shape[1]:], skip_special_tokens=True)
+                batched_generated_answer = [self.tokenizer.decode(generated_answer_ids[i], skip_special_tokens=True) for i in range(len(generated_answer_ids))]
             else:
                 batched_generated_answer = []
                 for i in range(len(generated_answer)):
@@ -487,7 +497,7 @@ class LLaDAEvalHarness(LM):
 if __name__ == "__main__":
 
     # import debugpy
-    # debugpy.listen(5678) 
+    # debugpy.listen(10486) 
     # debugpy.wait_for_client()
     # debugpy.breakpoint()
 
