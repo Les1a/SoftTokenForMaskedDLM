@@ -1,6 +1,6 @@
 # Soft Token Interpolation for Masked dLLM (LLaDA)
 
-This repository contains a training-free extension to masked diffusion LLMs that interpolates between a hard mask and a decoded token. Instead of collapsing masked positions to a single `[MASK]` embedding, we retain the model's probility distribution from the previous step, mix candidate embeddings, and feed the resulting **Soft Token** back into the next denoising pass. The outcome is a diffusion trajectory that keeps semantic information alive even when a position remains masked, thus improving information transition flow between diffusion steps.
+This repository contains a training-free extension to masked diffusion LLMs that interpolates between a hard mask and a decoded token. Instead of collapsing masked positions to a single `[MASK]` embedding, we retain the model's probability distribution from the previous step, mix candidate embeddings, and feed the resulting **Soft Token** back into the next denoising pass. The outcome is a diffusion trajectory that preserves semantic information even when a position remains masked, thus improving information transition flow across diffusion steps.
 
 The codebase originates from the llada part in [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM) implementation, and the idea of mixing candidate embeddings is inspired by the latent reasoning method proposed in [Soft Think](https://arxiv.org/abs/2505.15778).
 
@@ -19,7 +19,7 @@ The codebase originates from the llada part in [Fast-dLLM](https://github.com/NV
 ## Conceptual Overview
 
 - **Problem.** In masked diffusion decoding, only unmasked positions contribute signal during a denoising step. Specifically, early steps therefore operate on a sea of `[MASK]` embeddings, discarding useful information gathered in previous iterations.
-- **Idea.** Keep a continuous latent between "mask" and "token". When a position remains masked, store the predicted token distribution from the previous step and form a soft embedding by mixing candidate token embeddings ($\mathbf{e}_{\text{soft token}} = \sum_i p_i \cdot \mathbf{e}_{\text{candidate token}_i}$).
+- **Idea.** Keep a continuous latent between "mask" and "token". When a position remains masked, store the predicted token distribution from the previous step and form a soft embedding by mixing candidate token embeddings (![soft-token-eq](https://latex.codecogs.com/svg.image?\mathbf{e}_{soft}=%20\sum_i%20p_i%20\cdot%20\mathbf{e}_{candidate,i})).
 - **Benefits.**
   - Information from previous steps flows through the model even if the discrete token has not been committed.
   - Sampling is more efficient, because fewer steps are wasted rediscovering what was already inferred.
@@ -45,11 +45,10 @@ References: `generate_with_dual_cache_soft_token` and `get_transfer_index_soft_t
 
 Modify the model forward to accept two optional tensors: `soft_token` (top-`k` ids per position) and `prob` (their weights). When supplied:
 
-1. Retrieve the base token embeddings $\mathbf{e}_{\text{candidate token}_i}$ for all candidate tokens (via `F.embedding`).
+1. Retrieve the base token embeddings ![candidate-emb-eq](https://latex.codecogs.com/svg.image?\mathbf{e}_{candidate,i}) for all candidate tokens (via `F.embedding`).
 2. Compute the weighted mixture to form the soft embedding
-   $\mathbf{e}_{\text{soft token}} = \sum_i p_i \cdot \mathbf{e}_{\text{candidate token}_i},$
-   producing $\mathbf{e}_{\text{soft token}} \in \mathbb{R}^{B \times L \times d_{\text{model}}}$.
-3. For positions that remain `[MASK]`, replace their embeddings with $\mathbf{e}_{\text{soft token}}$; decoded (unmasked) positions retain their original embeddings.
+   ![soft-token-eq-2](https://latex.codecogs.com/svg.image?\mathbf{e}_{soft}=%20\sum_i%20p_i%20\cdot%20\mathbf{e}_{candidate,i}), producing ![soft-token-shape](https://latex.codecogs.com/svg.image?\mathbf{e}_{soft}\in\mathbb{R}^{B\times%20L\times%20d_{model}}).
+3. For positions that remain `[MASK]`, replace their embeddings with ![candidate-emb-eq](https://latex.codecogs.com/svg.image?\mathbf{e}_{soft}); decoded (unmasked) positions retain their original embeddings.
 
 References: `LLaDAModelLM.forward` in `model/modeling_llada.py`.
 
@@ -99,4 +98,4 @@ References: `LLaDAModelLM.forward` in `model/modeling_llada.py`.
 ## Soft Token Parameters
 
 - **Vary `k_soft`.** Adjust the number of candidate tokens `k_soft` in `get_transfer_index_soft_token` for expressiveness.
-- **Vary `addition_prob_mask`.** Change mask probility `bias` in `get_transfer_index_soft_token` to set how aggressively the model can revert to `[MASK]`.
+- **Vary `addition_prob_mask`.** Change mask probability `bias` in `get_transfer_index_soft_token` to set how aggressively the model can revert to `[MASK]`.
