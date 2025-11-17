@@ -84,6 +84,7 @@ class LLaDAEvalHarness(LM):
         merge_window=3,
         evolution_interval=4,
         soft_token=False,
+        bias=None,
         **kwargs,
     ):
         '''
@@ -151,6 +152,7 @@ class LLaDAEvalHarness(LM):
         self.dual_cache = dual_cache
         self.dual_branch = dual_branch
         self.soft_token = soft_token
+        self.bias = bias
 
         self.main_threshold = main_threshold
         self.spec_threshold = spec_threshold
@@ -377,12 +379,13 @@ class LLaDAEvalHarness(LM):
             else:
                 if self.use_cache:
                     if self.dual_cache and not self.soft_token:
-                        generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                            temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                        print(f"generate with evlove_block, bias={self.bias}")
+                        generated_answer, nfe = generate_with_dual_cache_evlove_block(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+                                            bias=self.bias, temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
                     elif self.soft_token:
-                        print("generate with soft token")
+                        print(f"generate with soft token, bias={self.bias}")
                         generated_answer, nfe = generate_with_dual_cache_soft_token(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                            temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                            bias=self.bias, temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
                     else:
                         generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                             temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)

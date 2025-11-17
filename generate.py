@@ -773,6 +773,7 @@ def generate_with_dual_cache_evlove_block(
     mask_id=126336,
     threshold=None,
     factor=None,
+    bias=None, 
 ):
     """
     New decode flow:
@@ -808,7 +809,7 @@ def generate_with_dual_cache_evlove_block(
         nfe += 1
 
         # Active window within the block starts small and grows as we decode
-        active_len = min(8, block_length)
+        active_len = min(bias, block_length)
 
         # A global boolean map for cache replacement; we expand it as active_len grows
         replace_position = torch.zeros_like(x, dtype=torch.bool, device=x.device)
@@ -879,7 +880,7 @@ def generate_with_dual_cache_evlove_block(
 
 @ torch.no_grad()
 def generate_with_dual_cache_soft_token(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-            remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+            remasking='low_confidence', mask_id=126336, threshold=None, factor=None, bias=None):
     '''
     Args:
         model: Mask predictor.
@@ -916,7 +917,7 @@ def generate_with_dual_cache_soft_token(model, prompt, steps=128, gen_length=128
         mask_index[:, current_block_end:] = 0
         if factor is None:
             x0, transfer_index, soft_token, prob = get_transfer_index_soft_token(
-                output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+                output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold, bias)
             soft_token, prob = soft_token[:, current_block_start:current_block_end], prob[:, current_block_start:current_block_end] 
         else:
             raise NotImplementedError("not yet support fator operation for soft token")
@@ -940,7 +941,7 @@ def generate_with_dual_cache_soft_token(model, prompt, steps=128, gen_length=128
             if factor is None:
                 x0, transfer_index, soft_token, prob = get_transfer_index_soft_token(
                     logits, temperature, remasking, mask_index, 
-                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold, bias)
             else:
                 raise NotImplementedError("not yet support fator operation for soft token")
             x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
@@ -1044,7 +1045,7 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
     return x0, transfer_index
 
 
-def get_transfer_index_soft_token(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
+def get_transfer_index_soft_token(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None, bias=None):
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
@@ -1074,7 +1075,7 @@ def get_transfer_index_soft_token(logits, temperature, remasking, mask_index, x,
     # TODO: soft token hyperparameters
     k_soft = 5  # hyperparameter 1
     prob, soft_token = torch.topk(p, k=k_soft, dim=-1)  # both (B, L, 5)
-    addition_prob_mask = 0.5 # hyperparameter 2
+    addition_prob_mask = bias if bias is not None else 0.5 # hyperparameter 2
     mask_prob = 1 - prob[..., :1] + addition_prob_mask  # (B, L, 1) with max probability
     mask_token = torch.full_like(soft_token[..., :1], 126336)
     prob = torch.cat((prob, mask_prob), dim=-1)
