@@ -18,13 +18,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "input_dir",
-        default="/home/hice1/kxia39/workspace/Llada_dual_branch/eval_results_soft_token/parallel_dual",
+        default="../eval_results/inst_parallel_dual",
         type=Path,
-        help="Directory that contains gsm8k_XX subfolders (e.g. eval_results_soft_token/base_parallel_dual).",
+        help="Directory that contains gsm8k_XX subfolders (e.g. eval_results_soft_token/inst_parallel_dual).",
     )
     parser.add_argument(
         "output",
-        default="prob1.5max_soft_token.json",
+        default="inst_baseline.json",
         type=Path,
         help="Destination JSON file. Existing content is updated in-place for the provided method key.",
     )
@@ -36,15 +36,9 @@ def parse_args() -> argparse.Namespace:
 
     # not needed, modify manually is ok
     parser.add_argument(
-        "--method-key",
-        default="method1",
-        help="Key to use in the JSON output (default: method1).",
-    )
-    # not needed, modify manually is ok
-    parser.add_argument(
-        "--method-name",
-        default=None,
-        help="Human readable name for the method. Defaults to the method key if omitted.",
+        "--name",
+        default="soft token",
+        help="Key to use in the JSON output.",
     )
     return parser.parse_args()
 
@@ -116,11 +110,11 @@ def write_output(output_path: Path, content: Dict[str, dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    method_payload = {"name": args.method_name or args.method_key}
+    method_payload = {"name": args.name}
     method_payload.update(collect_task_entries(args.input_dir, args.task))
 
     data = load_existing(args.output)
-    data[args.method_key] = method_payload
+    data[args.name] = method_payload
     write_output(args.output, data)
 
 
